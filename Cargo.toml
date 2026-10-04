@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "transpiler",
+    "compiler",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[profile.dev]
+opt-level = 0

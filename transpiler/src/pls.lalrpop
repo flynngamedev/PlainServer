@@ -1,0 +1,346 @@
+// LALRPOP grammar for the PlainS `.pls` language.
+//
+// PlainS is PlainVulkan's language with three deliberate differences, all
+// of them driven by what a *server* script spends its time doing:
+//
+//   1. OBJECT LITERALS (`{ "type": "welcome", "id": 3 }`). Every command
+//      that answers a client -- PlS::SendToPlayer, PlS::SendToAllPlayers --
+//      takes a structured payload, so without literals the average script
+//      would be dominated by field-at-a-time assignment. PlainVulkan has no
+//      object literal syntax; see point 3 for why adding one there is not
+//      the same decision.
+//
+//   2. FOR-IN (`for (player_id in players) { ... }`). The three central
+//      server loops -- over connected players, over all entities, over this
+//      frame's collisions -- are all "iterate this container", and a
+//      C-style counted loop obscures that.
+//
+//   3. NO BARE BLOCK STATEMENT. `{ ... }` on its own is no longer a
+//      statement; blocks appear only where a control-flow construct
+//      requires one. This is what *pays for* point 1: with both rules
+//      present, a `{` at the start of a statement is genuinely ambiguous
+//      (`{ "a": 1 }` could open a block whose first statement is the
+//      expression `"a"`, or an object literal), and no amount of
+//      restructuring fixes that within LALR(1) -- the decision has to be
+//      made on the `{` itself, one token before the evidence arrives.
+//      Dropping bare blocks costs nothing: their only real use is scoping a
+//      temporary, which a nested `function` already does.
+//
+//      This is also precisely why PlainVulkan does NOT get object literals
+//      as part of the same change: `.pv` is a language with programs
+//      already written against it, and removing a statement form from it
+//      would be a breaking change made for syntactic convenience.
+//      `Pv::SerializeInput(...)` exists to cover the common case there.
+//
+// Everything else -- precedence chain, external tokenizer, the single
+// assignment-vs-expression decision point -- is unchanged from pv.lalrpop,
+// including the reasoning in its comments about why that shape stays
+// conflict-free.
+
+use std::str::FromStr;
+use crate::ast::*;
+use crate::token::Tok;
+use crate::lexer::LexError;
+use crate::ast_helpers::{stmt_from_expr, forinit_from_expr, forupdate_from_expr};
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = LexError;
+
+    enum Tok {
+        "var" => Tok::KwVar,
+        "let" => Tok::KwLet,
+        "const" => Tok::KwConst,
+        "function" => Tok::KwFunction,
+        "return" => Tok::KwReturn,
+        "if" => Tok::KwIf,
+        "elif" => Tok::KwElif,
+        "else" => Tok::KwElse,
+        "while" => Tok::KwWhile,
+        "for" => Tok::KwFor,
+        "in" => Tok::KwIn,
+        "break" => Tok::KwBreak,
+        "continue" => Tok::KwContinue,
+        "true" => Tok::KwTrue,
+        "false" => Tok::KwFalse,
+        "null" => Tok::KwNull,
+
+        "{" => Tok::LBrace,
+        "}" => Tok::RBrace,
+        "(" => Tok::LParen,
+        ")" => Tok::RParen,
+        "[" => Tok::LBracket,
+        "]" => Tok::RBracket,
+        "," => Tok::Comma,
+        ";" => Tok::Semi,
+        "." => Tok::Dot,
+        "::" => Tok::ColonColon,
+        ":" => Tok::Colon,
+        "?" => Tok::Question,
+
+        "=" => Tok::Assign,
+        "+=" => Tok::PlusEq,
+        "-=" => Tok::MinusEq,
+        "*=" => Tok::StarEq,
+        "/=" => Tok::SlashEq,
+        "%=" => Tok::PercentEq,
+
+        "==" => Tok::EqEq,
+        "!=" => Tok::NotEq,
+        "<" => Tok::Lt,
+        ">" => Tok::Gt,
+        "<=" => Tok::LtEq,
+        ">=" => Tok::GtEq,
+
+        "&&" => Tok::AndAnd,
+        "||" => Tok::OrOr,
+        "!" => Tok::Bang,
+
+        "+" => Tok::Plus,
+        "-" => Tok::Minus,
+        "*" => Tok::Star,
+        "/" => Tok::Slash,
+        "%" => Tok::Percent,
+        "~" => Tok::Tilde,
+
+        "int" => Tok::Int(<i64>),
+        "float" => Tok::Float(<f64>),
+        "string" => Tok::Str(<String>),
+        "ident" => Tok::Ident(<String>),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Helper macros
+// ---------------------------------------------------------------------
+
+// Comma-separated list of T, allowing an optional trailing comma.
+Comma<T>: Vec<T> = {
+    <mut v:(<T> ",")*> <last:T?> => {
+        match last {
+            Some(x) => { v.push(x); v },
+            None => v,
+        }
+    }
+};
+
+// ---------------------------------------------------------------------
+// Program / items
+// ---------------------------------------------------------------------
+
+pub Program: Program = {
+    <stmts:Stmt*> => Program { stmts }
+};
+
+FunctionDecl: FunctionDecl = {
+    <l:@L> "function" <name:"ident"> "(" <params:Comma<"ident">> ")" <body:Block> <r:@R> =>
+        FunctionDecl { name, params, body, span: (l, r) },
+};
+
+Block: Block = {
+    <l:@L> "{" <stmts:Stmt*> "}" <r:@R> => Block { stmts, span: (l, r) },
+};
+
+// ---------------------------------------------------------------------
+// Statements
+// ---------------------------------------------------------------------
+
+// Note the absence of a `<b:Block> => Stmt::Block(b)` alternative -- see the
+// header comment. Block still appears below, but only as a *component* of
+// if/while/for/function, never as a statement in its own right, which is
+// what leaves `{` free to start an object literal in expression position.
+Stmt: Stmt = {
+    <s:VarDeclStmt> => Stmt::VarDecl(s),
+    <l:@L> <e:Expr> ";" <r:@R> => stmt_from_expr(e, (l, r)),
+    <s:IfStmt> => Stmt::If(s),
+    <s:WhileStmt> => Stmt::While(s),
+    <s:ForStmt> => Stmt::For(s),
+    <s:ForInStmt> => Stmt::ForIn(s),
+    <l:@L> "break" ";" <r:@R> => Stmt::Break((l, r)),
+    <l:@L> "continue" ";" <r:@R> => Stmt::Continue((l, r)),
+    <s:ReturnStmt> => Stmt::Return(s),
+    <f:FunctionDecl> => Stmt::Function(f),
+};
+
+DeclKw: DeclKind = {
+    "var" => DeclKind::Var,
+    "let" => DeclKind::Let,
+};
+
+VarDeclStmt: VarDeclStmt = {
+    <l:@L> <kind:DeclKw> <name:"ident"> <init:("=" <Expr>)?> ";" <r:@R> =>
+        VarDeclStmt { kind, name, init, span: (l, r) },
+    <l:@L> "const" <name:"ident"> "=" <init:Expr> ";" <r:@R> =>
+        VarDeclStmt { kind: DeclKind::Const, name, init: Some(init), span: (l, r) },
+};
+
+AssignOpTok: AssignOp = {
+    "=" => AssignOp::Assign,
+    "+=" => AssignOp::AddAssign,
+    "-=" => AssignOp::SubAssign,
+    "*=" => AssignOp::MulAssign,
+    "/=" => AssignOp::DivAssign,
+    "%=" => AssignOp::ModAssign,
+};
+
+IfStmt: IfStmt = {
+    <l:@L> "if" "(" <cond:Expr> ")" <then_block:Block>
+        <elifs:ElifClause*>
+        <else_block:("else" <Block>)?> <r:@R> =>
+        IfStmt { cond, then_block, elifs, else_block, span: (l, r) },
+};
+
+ElifClause: (Expr, Block) = {
+    "elif" "(" <cond:Expr> ")" <b:Block> => (cond, b),
+};
+
+WhileStmt: WhileStmt = {
+    <l:@L> "while" "(" <cond:Expr> ")" <body:Block> <r:@R> =>
+        WhileStmt { cond, body, span: (l, r) },
+};
+
+ForStmt: ForStmt = {
+    <l:@L> "for" "(" <init:ForInit> ";" <cond:Expr?> ";" <update:ForUpdate> ")" <body:Block> <r:@R> =>
+        ForStmt { init, cond, update, body, span: (l, r) },
+};
+
+// `for (name in iterable)`. This does not conflict with the counted `for`
+// above even though both begin `for ( ident`: the parser only has to choose
+// once it can see the token after the identifier, and `in` appears in no
+// expression's follow set, so one token of lookahead settles it.
+ForInStmt: ForInStmt = {
+    <l:@L> "for" "(" <name:"ident"> "in" <iterable:Expr> ")" <body:Block> <r:@R> =>
+        ForInStmt { var_name: name, iterable, body, span: (l, r) },
+};
+
+ForInit: ForInit = {
+    <l:@L> <kind:DeclKw> <name:"ident"> <init:("=" <Expr>)?> <r:@R> =>
+        ForInit::VarDecl(VarDeclStmt { kind, name, init, span: (l, r) }),
+    <l:@L> <e:Expr> <r:@R> => forinit_from_expr(e, (l, r)),
+    => ForInit::Empty,
+};
+
+ForUpdate: ForUpdate = {
+    <l:@L> <e:Expr> <r:@R> => forupdate_from_expr(e, (l, r)),
+    => ForUpdate::Empty,
+};
+
+ReturnStmt: ReturnStmt = {
+    <l:@L> "return" <value:Expr?> ";" <r:@R> => ReturnStmt { value, span: (l, r) },
+};
+
+// ---------------------------------------------------------------------
+// Expressions -- precedence chain identical to PlainVulkan's.
+// ---------------------------------------------------------------------
+
+pub Expr: Expr = AssignExpr;
+
+AssignExpr: Expr = {
+    <l:@L> <target:Postfix> <op:AssignOpTok> <value:AssignExpr> <r:@R> =>? {
+        let lvalue = LValue::from_expr(target)
+            .map_err(|span| lalrpop_util::ParseError::User {
+                error: LexError::InvalidAssignmentTarget(span.0, span.1),
+            })?;
+        Ok(Expr::Assign(Box::new(lvalue), op, Box::new(value), (l, r)))
+    },
+    Ternary,
+};
+
+Ternary: Expr = {
+    <l:@L> <c:LogicalOr> "?" <t:Expr> ":" <f:Expr> <r:@R> =>
+        Expr::Ternary(Box::new(c), Box::new(t), Box::new(f), (l, r)),
+    LogicalOr,
+};
+
+LogicalOr: Expr = {
+    <l:@L> <a:LogicalOr> "||" <b:LogicalAnd> <r:@R> =>
+        Expr::Binary(BinaryOp::Or, Box::new(a), Box::new(b), (l, r)),
+    LogicalAnd,
+};
+
+LogicalAnd: Expr = {
+    <l:@L> <a:LogicalAnd> "&&" <b:Equality> <r:@R> =>
+        Expr::Binary(BinaryOp::And, Box::new(a), Box::new(b), (l, r)),
+    Equality,
+};
+
+Equality: Expr = {
+    <l:@L> <a:Equality> "==" <b:Relational> <r:@R> =>
+        Expr::Binary(BinaryOp::Eq, Box::new(a), Box::new(b), (l, r)),
+    <l:@L> <a:Equality> "!=" <b:Relational> <r:@R> =>
+        Expr::Binary(BinaryOp::Ne, Box::new(a), Box::new(b), (l, r)),
+    Relational,
+};
+
+Relational: Expr = {
+    <l:@L> <a:Relational> "<" <b:Additive> <r:@R> =>
+        Expr::Binary(BinaryOp::Lt, Box::new(a), Box::new(b), (l, r)),
+    <l:@L> <a:Relational> ">" <b:Additive> <r:@R> =>
+        Expr::Binary(BinaryOp::Gt, Box::new(a), Box::new(b), (l, r)),
+    <l:@L> <a:Relational> "<=" <b:Additive> <r:@R> =>
+        Expr::Binary(BinaryOp::Le, Box::new(a), Box::new(b), (l, r)),
+    <l:@L> <a:Relational> ">=" <b:Additive> <r:@R> =>
+        Expr::Binary(BinaryOp::Ge, Box::new(a), Box::new(b), (l, r)),
+    Additive,
+};
+
+Additive: Expr = {
+    <l:@L> <a:Additive> "+" <b:Multiplicative> <r:@R> =>
+        Expr::Binary(BinaryOp::Add, Box::new(a), Box::new(b), (l, r)),
+    <l:@L> <a:Additive> "-" <b:Multiplicative> <r:@R> =>
+        Expr::Binary(BinaryOp::Sub, Box::new(a), Box::new(b), (l, r)),
+    Multiplicative,
+};
+
+Multiplicative: Expr = {
+    <l:@L> <a:Multiplicative> "*" <b:UnaryExpr> <r:@R> =>
+        Expr::Binary(BinaryOp::Mul, Box::new(a), Box::new(b), (l, r)),
+    <l:@L> <a:Multiplicative> "/" <b:UnaryExpr> <r:@R> =>
+        Expr::Binary(BinaryOp::Div, Box::new(a), Box::new(b), (l, r)),
+    <l:@L> <a:Multiplicative> "%" <b:UnaryExpr> <r:@R> =>
+        Expr::Binary(BinaryOp::Mod, Box::new(a), Box::new(b), (l, r)),
+    UnaryExpr,
+};
+
+UnaryExpr: Expr = {
+    <l:@L> "-" <e:UnaryExpr> <r:@R> => Expr::Unary(UnaryOp::Neg, Box::new(e), (l, r)),
+    <l:@L> "!" <e:UnaryExpr> <r:@R> => Expr::Unary(UnaryOp::Not, Box::new(e), (l, r)),
+    <l:@L> "~" <e:UnaryExpr> <r:@R> => Expr::Unary(UnaryOp::BitNot, Box::new(e), (l, r)),
+    Postfix,
+};
+
+Postfix: Expr = {
+    <l:@L> <b:Postfix> "(" <args:Comma<Expr>> ")" <r:@R> =>
+        Expr::Call(Box::new(b), args, (l, r)),
+    <l:@L> <b:Postfix> "[" <i:Expr> "]" <r:@R> =>
+        Expr::Index(Box::new(b), Box::new(i), (l, r)),
+    <l:@L> <b:Postfix> "." <m:"ident"> <r:@R> =>
+        Expr::Member(Box::new(b), m, (l, r)),
+    <l:@L> <b:Postfix> "::" <m:"ident"> <r:@R> =>
+        Expr::Scope(Box::new(b), m, (l, r)),
+    Primary,
+};
+
+// Object literal keys may be written as strings (`{"type": ...}`, matching
+// the wire format they usually become) or as bare identifiers
+// (`{type: ...}`) where the key is a plain word. Both produce the same
+// String key -- the distinction is purely how it reads in source.
+ObjectField: (String, Expr) = {
+    <k:"string"> ":" <v:Expr> => (k, v),
+    <k:"ident"> ":" <v:Expr> => (k, v),
+};
+
+Primary: Expr = {
+    <l:@L> <n:"int"> <r:@R> => Expr::IntLiteral(n, (l, r)),
+    <l:@L> <n:"float"> <r:@R> => Expr::FloatLiteral(n, (l, r)),
+    <l:@L> <s:"string"> <r:@R> => Expr::StringLiteral(s, (l, r)),
+    <l:@L> "true" <r:@R> => Expr::BoolLiteral(true, (l, r)),
+    <l:@L> "false" <r:@R> => Expr::BoolLiteral(false, (l, r)),
+    <l:@L> "null" <r:@R> => Expr::NullLiteral((l, r)),
+    <l:@L> <id:"ident"> <r:@R> => Expr::Ident(id, (l, r)),
+    "(" <e:Expr> ")" => e,
+    <l:@L> "[" <elems:Comma<Expr>> "]" <r:@R> => Expr::ArrayLiteral(elems, (l, r)),
+    <l:@L> "{" <fields:Comma<ObjectField>> "}" <r:@R> => Expr::ObjectLiteral(fields, (l, r)),
+};

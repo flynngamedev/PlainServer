@@ -1,0 +1,10 @@
+{
+  "name": "mp_server",
+  "version": "0.1.0",
+  "entry": "main.pls",
+  "server": {
+    "port": 8080,
+    "tickrate": 60,
+    "max_players": 64
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "pls-compiler"
+version = "2.6.0"
+edition = "2021"
+description = "AST -> C++ code generator and native build orchestrator for PlainServer"
+
+[[bin]]
+name = "plscc"
+path = "src/bin/plscc.rs"
+
+[dependencies]
+pls-transpiler = { path = "../transpiler" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# std::fs::canonicalize returns \\?\-prefixed verbatim paths on Windows,
+# which break once written into a CMakeLists.txt path (see plscc.rs).
+# dunce::canonicalize strips the prefix when it isn't needed.
+dunce = "1"
