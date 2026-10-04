@@ -1,0 +1,41 @@
+name: Unzip Server to Root
+on:
+  workflow_dispatch: # Allows you to run this manually on mobile
+
+permissions:
+  contents: write
+
+jobs:
+  extract-and-move:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install 7-Zip
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+      - name: Extract archive to temporary folder
+        run: 7z x plainserver_v2.6.7z -o./temp_extraction/
+
+      - name: Move files directly to root
+        run: |
+          # Move everything from the inner folder if it created one, otherwise from temp
+          if [ -d "./temp_extraction/plainserver_v2.6" ]; then
+            mv ./temp_extraction/plainserver_v2.6/* . 2>/dev/null || true
+            mv ./temp_extraction/plainserver_v2.6/.* . 2>/dev/null || true
+          else
+            mv ./temp_extraction/* . 2>/dev/null || true
+            mv ./temp_extraction/.* . 2>/dev/null || true
+          fi
+
+      - name: Clean up temporary items and original zip
+        run: rm -rf temp_extraction plainserver_v2.6.7z
+
+      - name: Commit and push files back to repo
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Extract PlainServer files directly to root"
+          git push
